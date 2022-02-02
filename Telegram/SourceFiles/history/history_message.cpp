@@ -18,7 +18,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_item_components.h"
 #include "history/history_location_manager.h"
 #include "history/history_service.h"
-#include "history/history_unread_things.h"
 #include "history/view/history_view_service_message.h"
 #include "history/view/history_view_context_menu.h" // CopyPostLink.
 #include "history/view/history_view_spoiler_click_handler.h"
@@ -501,18 +500,37 @@ HistoryMessage::HistoryMessage(
 	if (const auto media = data.vmedia()) {
 		setMedia(*media);
 	}
-	const auto textWithEntities = TextWithEntities{
-		qs(data.vmessage()),
-		Api::EntitiesFromMTP(
-			&history->session(),
-			data.ventities().value_or_empty())
-	};
-	setText(_media ? textWithEntities : EnsureNonEmpty(textWithEntities));
+
+	PeerId from = data.vfrom_id() ? peerFromMTP(*data.vfrom_id()) : PeerId(0);
+	PeerData* pd = from ? history->owner().peer(from) : history->peer;
+	if (pd->isUser() && pd->asUser()->isBlocked()) {
+		setText({
+			qs("The message from mentally unhealthy."),
+			Api::EntitiesFromMTP(
+				&history->session(),
+				data.ventities().value_or_empty())
+		});
+	} else {
+		if (const auto media = data.vmedia()) {
+			setMedia(*media);
+		}
+		const auto textWithEntities = TextWithEntities{
+			qs(data.vmessage()),
+			Api::EntitiesFromMTP(
+				&history->session(),
+				data.ventities().value_or_empty())
+		};
+		setText(_media ? textWithEntities : EnsureNonEmpty(textWithEntities));
+	}
+
 	if (const auto groupedId = data.vgrouped_id()) {
 		setGroupId(
 			MessageGroupId::FromRaw(history->peer->id, groupedId->v));
 	}
-	setReactions(data.vreactions());
+	if (const auto reactions = data.vreactions()) {
+		setReactions(reactions);
+	}
+
 	applyTTL(data);
 }
 
@@ -1527,39 +1545,19 @@ void HistoryMessage::contributeToSlowmode(TimeId realDate) {
 	}
 }
 
-void HistoryMessage::addToUnreadThings(HistoryUnreadThings::AddType type) {
-	if (!isRegular()) {
-		return;
-	}
-	if (isUnreadMention()) {
-		if (history()->unreadMentions().add(id, type)) {
+void HistoryMessage::addToUnreadMentions(UnreadMentionType type) {
+	if (isRegular() && isUnreadMention()) {
+		if (history()->addToUnreadMentions(id, type)) {
 			history()->session().changes().historyUpdated(
 				history(),
 				Data::HistoryUpdate::Flag::UnreadMentions);
-		}
-	}
-	if (hasUnreadReaction()) {
-		if (history()->unreadReactions().add(id, type)) {
-			if (type == HistoryUnreadThings::AddType::New) {
-				history()->session().changes().messageUpdated(
-					this,
-					Data::MessageUpdate::Flag::NewUnreadReaction);
-			}
-			if (hasUnreadReaction()) {
-				history()->session().changes().historyUpdated(
-					history(),
-					Data::HistoryUpdate::Flag::UnreadReactions);
-			}
 		}
 	}
 }
 
 void HistoryMessage::destroyHistoryEntry() {
 	if (isUnreadMention()) {
-		history()->unreadMentions().erase(id);
-	}
-	if (hasUnreadReaction()) {
-		history()->unreadReactions().erase(id);
+		history()->eraseFromUnreadMentions(id);
 	}
 	if (const auto reply = Get<HistoryMessageReply>()) {
 		changeReplyToTopCounter(reply, -1);

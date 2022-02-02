@@ -253,18 +253,15 @@ Message::Message(
 	initLogEntryOriginal();
 	initPsa();
 	refreshReactions();
-	auto animations = replacing
-		? replacing->takeReactionAnimations()
-		: base::flat_map<QString, std::unique_ptr<Reactions::Animation>>();
-	if (!animations.empty()) {
-		const auto repainter = [=] { repaint(); };
-		for (const auto &[emoji, animation] : animations) {
-			animation->setRepaintCallback(repainter);
-		}
+	auto animation = replacing
+		? replacing->takeSendReactionAnimation()
+		: nullptr;
+	if (animation) {
+		animation->setRepaintCallback([=] { repaint(); });
 		if (_reactions) {
-			_reactions->continueAnimations(std::move(animations));
+			_reactions->continueSendAnimation(std::move(animation));
 		} else {
-			_bottomInfo.continueReactionAnimations(std::move(animations));
+			_bottomInfo.continueSendReactionAnimation(std::move(animation));
 		}
 	}
 }
@@ -329,7 +326,7 @@ void Message::applyGroupAdminChanges(
 	}
 }
 
-void Message::animateReaction(ReactionAnimationArgs &&args) {
+void Message::animateSendReaction(SendReactionAnimationArgs &&args) {
 	const auto item = message();
 	const auto media = this->media();
 
@@ -356,12 +353,12 @@ void Message::animateReaction(ReactionAnimationArgs &&args) {
 			: 0;
 		g.setHeight(g.height() - reactionsHeight);
 		const auto reactionsPosition = QPoint(reactionsLeft + g.left(), g.top() + g.height() + st::mediaInBubbleSkip);
-		_reactions->animate(args.translated(-reactionsPosition), repainter);
+		_reactions->animateSend(args.translated(-reactionsPosition), repainter);
 		return;
 	}
 
 	const auto animateInBottomInfo = [&](QPoint bottomRight) {
-		_bottomInfo.animateReaction(args.translated(-bottomRight), repainter);
+		_bottomInfo.animateReactionSend(args.translated(-bottomRight), repainter);
 	};
 	if (bubble) {
 		auto entry = logEntryOriginal();
@@ -384,13 +381,13 @@ void Message::animateReaction(ReactionAnimationArgs &&args) {
 		if (reactionsInBubble) {
 			trect.setHeight(trect.height() - reactionsHeight);
 			const auto reactionsPosition = QPoint(trect.left(), trect.top() + trect.height() + reactionsTop);
-			_reactions->animate(args.translated(-reactionsPosition), repainter);
+			_reactions->animateSend(args.translated(-reactionsPosition), repainter);
 			return;
 		}
 		if (_viewButton) {
 			const auto belowInfo = _viewButton->belowMessageInfo();
 			const auto infoHeight = reactionsInBubble
-				? (reactionsHeight + 2 * st::mediaInBubbleSkip)
+				? (reactionsHeight + st::msgPadding.bottom())
 				: _bottomInfo.height();
 			const auto heightMargins = QMargins(0, 0, 0, infoHeight);
 			if (belowInfo) {
@@ -398,7 +395,7 @@ void Message::animateReaction(ReactionAnimationArgs &&args) {
 			}
 			trect.setHeight(trect.height() - _viewButton->height());
 			if (reactionsInBubble) {
-				trect.setHeight(trect.height() - st::mediaInBubbleSkip + st::msgPadding.bottom());
+				trect.setHeight(trect.height() + st::msgPadding.bottom());
 			} else if (mediaDisplayed) {
 				trect.setHeight(trect.height() - st::mediaInBubbleSkip);
 			}
@@ -427,15 +424,17 @@ void Message::animateReaction(ReactionAnimationArgs &&args) {
 	}
 }
 
-auto Message::takeReactionAnimations()
--> base::flat_map<QString, std::unique_ptr<Reactions::Animation>> {
+auto Message::takeSendReactionAnimation()
+-> std::unique_ptr<Reactions::SendAnimation> {
 	return _reactions
-		? _reactions->takeAnimations()
-		: _bottomInfo.takeReactionAnimations();
+		? _reactions->takeSendAnimation()
+		: _bottomInfo.takeSendReactionAnimation();
 }
 
 QSize Message::performCountOptimalSize() {
 	const auto item = message();
+	PeerData* pd = item->from();
+        if ((pd->isUser() && pd->asUser()->isBlocked()) || item->isSponsored()) return QSize(0,0);
 	const auto media = this->media();
 
 	auto maxWidth = 0;
@@ -486,7 +485,7 @@ QSize Message::performCountOptimalSize() {
 			accumulate_max(
 				maxWidth,
 				std::min(st::msgMaxWidth, reactionsMaxWidth));
-			if (!mediaDisplayed || _viewButton) {
+			if (!mediaDisplayed) {
 				minHeight += st::mediaInBubbleSkip;
 			}
 			if (maxWidth >= reactionsMaxWidth) {
@@ -631,6 +630,8 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 	}
 
 	const auto item = message();
+	PeerData* pd = item->from();
+        if ((pd->isUser() && pd->asUser()->isBlocked()) || item->isSponsored())  return;
 	const auto media = this->media();
 
 	const auto stm = context.messageStyle();
@@ -732,8 +733,8 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 		const auto reactionsPosition = QPoint(reactionsLeft + g.left(), g.top() + g.height() + st::mediaInBubbleSkip);
 		p.translate(reactionsPosition);
 		_reactions->paint(p, context, g.width(), context.clip.translated(-reactionsPosition));
-		if (context.reactionInfo) {
-			context.reactionInfo->position = reactionsPosition;
+		if (context.reactionEffects && context.reactionEffects->paint) {
+			context.reactionEffects->offset += reactionsPosition;
 		}
 		p.translate(-reactionsPosition);
 	}
@@ -787,8 +788,8 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 			const auto reactionsPosition = QPoint(trect.left(), trect.top() + trect.height() + reactionsTop);
 			p.translate(reactionsPosition);
 			_reactions->paint(p, context, g.width(), context.clip.translated(-reactionsPosition));
-			if (context.reactionInfo) {
-				context.reactionInfo->position = reactionsPosition;
+			if (context.reactionEffects && context.reactionEffects->paint) {
+				context.reactionEffects->offset += reactionsPosition;
 			}
 			p.translate(-reactionsPosition);
 		}
@@ -796,7 +797,7 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 		if (_viewButton) {
 			const auto belowInfo = _viewButton->belowMessageInfo();
 			const auto infoHeight = reactionsInBubble
-				? (reactionsHeight + 2 * st::mediaInBubbleSkip)
+				? (reactionsHeight + st::msgPadding.bottom())
 				: _bottomInfo.height();
 			const auto heightMargins = QMargins(0, 0, 0, infoHeight);
 			_viewButton->draw(
@@ -810,7 +811,7 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 			}
 			trect.setHeight(trect.height() - _viewButton->height());
 			if (reactionsInBubble) {
-				trect.setHeight(trect.height() - st::mediaInBubbleSkip + st::msgPadding.bottom());
+				trect.setHeight(trect.height() + st::msgPadding.bottom());
 			} else if (mediaDisplayed) {
 				trect.setHeight(trect.height() - st::mediaInBubbleSkip);
 			}
@@ -845,12 +846,10 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 			media->draw(p, context.translated(
 				-mediaPosition
 			).withSelection(skipTextSelection(context.selection)));
-			if (context.reactionInfo && !displayInfo && !_reactions) {
-				const auto add = QPoint(0, mediaHeight);
-				context.reactionInfo->position = mediaPosition + add;
-				if (context.reactionInfo->effectPaint) {
-					context.reactionInfo->effectOffset -= add;
-				}
+			if (context.reactionEffects
+				&& context.reactionEffects->paint
+				&& !_reactions) {
+				context.reactionEffects->offset += mediaPosition;
 			}
 			p.translate(-mediaPosition);
 		}
@@ -881,13 +880,6 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 				inner.top() + inner.height(),
 				2 * inner.left() + inner.width(),
 				InfoDisplayType::Default);
-			if (context.reactionInfo && !_reactions) {
-				const auto add = QPoint(0, inner.top() + inner.height());
-				context.reactionInfo->position = add;
-				if (context.reactionInfo->effectPaint) {
-					context.reactionInfo->effectOffset -= add;
-				}
-			}
 			if (_comments) {
 				const auto o = p.opacity();
 				p.setOpacity(0.3);
@@ -913,12 +905,8 @@ void Message::draw(Painter &p, const PaintContext &context) const {
 		media->draw(p, context.translated(
 			-g.topLeft()
 		).withSelection(skipTextSelection(context.selection)));
-		if (context.reactionInfo && !_reactions) {
-			const auto add = QPoint(0, g.height());
-			context.reactionInfo->position = g.topLeft() + add;
-			if (context.reactionInfo->effectPaint) {
-				context.reactionInfo->effectOffset -= add;
-			}
+		if (context.reactionEffects && context.reactionEffects->paint && !_reactions) {
+			context.reactionEffects->offset += g.topLeft();
 		}
 		p.translate(-g.topLeft());
 	}
@@ -1474,7 +1462,7 @@ TextState Message::textState(
 		if (_viewButton) {
 			const auto belowInfo = _viewButton->belowMessageInfo();
 			const auto infoHeight = reactionsInBubble
-				? (reactionsHeight + 2 * st::mediaInBubbleSkip)
+				? (reactionsHeight + st::msgPadding.bottom())
 				: _bottomInfo.height();
 			const auto heightMargins = QMargins(0, 0, 0, infoHeight);
 			if (_viewButton->getState(
@@ -1486,17 +1474,19 @@ TextState Message::textState(
 				return result;
 			}
 			if (belowInfo) {
-				inner.setHeight(inner.height() - _viewButton->height());
+				inner -= heightMargins;
 			}
 			trect.setHeight(trect.height() - _viewButton->height());
 			if (reactionsInBubble) {
-				trect.setHeight(trect.height() - st::mediaInBubbleSkip + st::msgPadding.bottom());
+				trect.setHeight(trect.height() + st::msgPadding.bottom());
 			} else if (mediaDisplayed) {
 				trect.setHeight(trect.height() - st::mediaInBubbleSkip);
 			}
 		}
 		if (mediaOnBottom) {
-			trect.setHeight(trect.height() + st::msgPadding.bottom());
+			trect.setHeight(trect.height()
+				+ st::msgPadding.bottom()
+				- viewButtonHeight());
 		}
 		if (mediaOnTop) {
 			trect.setY(trect.y() - st::msgPadding.top());
@@ -2164,7 +2154,7 @@ void Message::refreshReactions() {
 					strong->data()->toggleReaction(emoji);
 					if (const auto now = weak.get()) {
 						if (now->data()->chosenReaction() == emoji) {
-							now->animateReaction({
+							now->animateSendReaction({
 								.emoji = emoji,
 							});
 						}
@@ -2899,7 +2889,7 @@ int Message::resizeContentGetHeight(int newWidth) {
 				newHeight += entry->resizeGetHeight(contentWidth);
 			}
 			if (reactionsInBubble) {
-				if (!mediaDisplayed || _viewButton) {
+				if (!mediaDisplayed) {
 					newHeight += st::mediaInBubbleSkip;
 				}
 				newHeight += _reactions->height();
